@@ -1,84 +1,59 @@
-require("dotenv").config();
-const express = require("express");
+if (process.env.NODE_ENV !== 'production') {
+  require("dotenv").config();
+}const express = require("express");
 const path = require("path");
 const cors = require("cors");
-const sqlite3 = require("sqlite3").verbose();
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const { Pool } = require('pg'); // Changed from sqlite3
 
 const app = express();
 const port = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-if (!JWT_SECRET) {
-  console.error("FATAL ERROR: JWT_SECRET is not defined in .env file.");
-  process.exit(1);
+if (!process.env.JWT_SECRET) {
+  console.warn("WARNING: JWT_SECRET is missing from environment variables.");
 }
 
-// Database Setup
-const db = new sqlite3.Database("./projects.db", (err) => {
-  if (err) console.error("Error connecting to database:", err.message);
-  else console.log("Connected to SQLite database.");
+// Database Setup for Vercel/Postgres
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL, 
+  ssl: { rejectUnauthorized: false }
 });
 
-// Initialize Database Tables
-db.serialize(() => {
-  // Inquiries Table (Includes 'projectDescription' and 'status')
-  db.run(`CREATE TABLE IF NOT EXISTS inquiries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        submissionDate DATETIME DEFAULT CURRENT_TIMESTAMP,
+// Initialize Tables (Postgres Syntax)
+const initDb = async () => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS inquiries (
+        id SERIAL PRIMARY KEY,
+        submissionDate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         status TEXT DEFAULT 'New',
         clientName TEXT,
         contactPerson TEXT,
         email TEXT,
         phone TEXT,
         projectName TEXT,
-        projectDescription TEXT,  -- Field for project description
+        projectDescription TEXT,
         dueDate TEXT,
-        budget REAL,
+        budget DECIMAL,
         duration INTEGER
-    )`);
-
-  // 2. Users Table
-  db.run(
-    `CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        passwordHash TEXT NOT NULL,
+      );
+    `);
+    
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE,
+        passwordHash TEXT,
         role TEXT DEFAULT 'admin'
-    )`,
-    (err) => {
-      if (!err) {
-        // Check for default admin on startup
-        db.get(`SELECT * FROM users WHERE username = 'admin'`, (err, row) => {
-          if (!row) {
-            bcrypt.hash("password123", 10, (err, hash) => {
-              if (err) {
-                console.error("Error hashing password:", err.message);
-                return;
-              }
-              if (hash) {
-                db.run(
-                  `INSERT INTO users (username, passwordHash) VALUES (?, ?)`,
-                  ["admin", hash],
-                  (insertErr) => {
-                    if (insertErr) {
-                      console.error("Error creating default admin:", insertErr.message);
-                    } else {
-                      console.log(
-                        "Default admin user 'admin' (password123) created."
-                      );
-                    }
-                  }
-                );
-              }
-            });
-          }
-        });
-      }
-    }
-  );
-});
+      );
+    `);
+  } catch (err) {
+    console.error("Initialization Error:", err);
+  }
+};
+initDb();
 
 // Middleware
 app.use(cors());
@@ -90,8 +65,7 @@ app.use(express.static(path.join(__dirname)));
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
-  if (token == null)
-    return res.status(401).json({ message: "No token provided" });
+  if (!token) return res.status(401).json({ message: "No token provided" });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ message: "Token invalid/expired" });
@@ -100,147 +74,93 @@ function authenticateToken(req, res, next) {
   });
 }
 
-//    PUBLIC ROUTES
-// Submit New Project
-app.post("/api/project-submission", (req, res) => {
+// --- UPDATED ROUTES (Postgres uses $1 instead of ?) ---
+
+app.post("/api/project-submission", async (req, res) => {
   const data = req.body;
-  // Ensure the query includes projectDescription
-  const sql = `INSERT INTO inquiries (clientName, contactPerson, email, phone, projectName, projectDescription, dueDate, budget, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const sql = `INSERT INTO inquiries (clientName, contactPerson, email, phone, projectName, projectDescription, dueDate, budget, duration) 
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`;
   const params = [
-    data.clientName,
-    data.contactPerson,
-    data.email,
-    data.phone,
-    data.projectName,
-    data.projectDescription, // <-- Included data parameter
-    data.dueDate,
-    data.budget,
-    data.duration,
+    data.clientName, data.contactPerson, data.email, data.phone,
+    data.projectName, data.projectDescription, data.dueDate, data.budget, data.duration,
   ];
 
-  db.run(sql, params, function (err) {
-    if (err)
-      return res
-        .status(500)
-        .json({ message: "Database error", error: err.message });
-    console.log(`New inquiry ID ${this.lastID}: ${data.projectName}`);
-    res.status(201).json({ message: "Inquiry received", id: this.lastID });
-  });
+  try {
+    const result = await db.query(sql, params);
+    res.status(201).json({ message: "Inquiry received", id: result.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ message: "Database error", error: err.message });
+  }
 });
 
-// Admin Login
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const { username, password } = req.body;
-  db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
-    if (err) return res.status(500).json({ message: "Database error" });
+  try {
+    const result = await db.query("SELECT * FROM users WHERE username = $1", [username]);
+    const user = result.rows[0];
+
     if (!user) return res.status(401).json({ message: "Invalid credentials" });
 
-    bcrypt.compare(password, user.passwordHash, (err, isMatch) => {
-      if (isMatch) {
-        const token = jwt.sign(
-          { id: user.id, username: user.username, role: user.role },
-          JWT_SECRET,
-          { expiresIn: "2h" }
-        );
-        // Send back the username to be stored in localStorage
-        res.json({
-          message: "Login successful",
-          token,
-          username: user.username,
-        });
-      } else {
-        res.status(401).json({ message: "Invalid credentials" });
-      }
-    });
-  });
-});
-
-//   PROTECTED PROJECT ROUTES
-
-// GET all projects
-app.get("/api/projects", authenticateToken, (req, res) => {
-  db.all(
-    "SELECT * FROM inquiries ORDER BY submissionDate DESC",
-    [],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
+    const isMatch = await bcrypt.compare(password, user.passwordHash);
+    if (isMatch) {
+      const token = jwt.sign(
+        { id: user.id, username: user.username, role: user.role },
+        JWT_SECRET,
+        { expiresIn: "2h" }
+      );
+      res.json({ message: "Login successful", token, username: user.username });
+    } else {
+      res.status(401).json({ message: "Invalid credentials" });
     }
-  );
+  } catch (err) {
+    res.status(500).json({ message: "Database error" });
+  }
 });
 
-// DELETE project
-app.delete("/api/projects/:id", authenticateToken, (req, res) => {
-  db.run("DELETE FROM inquiries WHERE id = ?", [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Project deleted", changes: this.changes });
-  });
+app.get("/api/projects", authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query("SELECT * FROM inquiries ORDER BY submissionDate DESC");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// project details
-app.put("/api/projects/:id", authenticateToken, (req, res) => {
+app.delete("/api/projects/:id", authenticateToken, async (req, res) => {
+  try {
+    await db.query("DELETE FROM inquiries WHERE id = $1", [req.params.id]);
+    res.json({ message: "Project deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/projects/:id", authenticateToken, async (req, res) => {
   const d = req.body;
-  // Ensure the update query includes projectDescription
-  const sql = `UPDATE inquiries SET clientName=?, contactPerson=?, email=?, phone=?, projectName=?, projectDescription=?, dueDate=?, budget=?, duration=? WHERE id=?`;
+  const sql = `UPDATE inquiries SET clientName=$1, contactPerson=$2, email=$3, phone=$4, projectName=$5, projectDescription=$6, dueDate=$7, budget=$8, duration=$9 WHERE id=$10`;
   const params = [
-    d.clientName,
-    d.contactPerson,
-    d.email,
-    d.phone,
-    d.projectName,
-    d.projectDescription || null, // <-- Included data parameter
-    d.dueDate,
-    d.budget,
-    d.duration,
-    req.params.id,
+    d.clientName, d.contactPerson, d.email, d.phone, d.projectName,
+    d.projectDescription || null, d.dueDate, d.budget, d.duration, req.params.id
   ];
-  db.run(sql, params, function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Project updated", changes: this.changes });
-  });
+  try {
+    await db.query(sql, params);
+    res.json({ message: "Project updated" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.patch("/api/projects/:id/status", authenticateToken, (req, res) => {
+app.patch("/api/projects/:id/status", authenticateToken, async (req, res) => {
   const { status } = req.body;
-  db.run(
-    "UPDATE inquiries SET status = ? WHERE id = ?",
-    [status, req.params.id],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({
-        message: `Status updated to ${status}`,
-        changes: this.changes,
-      });
-    }
-  );
-});
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down gracefully...');
-  db.close((err) => {
-    if (err) {
-      console.error('Error closing database:', err.message);
-    } else {
-      console.log('Database connection closed.');
-    }
-    process.exit(0);
-  });
-});
-
-process.on('SIGTERM', () => {
-  console.log('\nShutting down gracefully...');
-  db.close((err) => {
-    if (err) {
-      console.error('Error closing database:', err.message);
-    } else {
-      console.log('Database connection closed.');
-    }
-    process.exit(0);
-  });
+  try {
+    await db.query("UPDATE inquiries SET status = $1 WHERE id = $2", [status, req.params.id]);
+    res.json({ message: `Status updated to ${status}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Start Server
 app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+  console.log(`Server running on port ${port}`);
 });
